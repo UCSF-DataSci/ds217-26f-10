@@ -27,8 +27,12 @@ only, or refitted on training plus validation rows.
 Downstream decisions, fitted values, residuals, and test metrics also accept
 values calculated correctly from the student's earlier saved artifacts. A
 recognized common slip that affects several checks is charged once, by the
-first affected check. Duplicate headers cost the columns check; every stored
-copy is considered rather than silently discarding a column.
+first affected check, and so are rows whose values all sit under each other's
+labels. Duplicate headers cost the columns check; every stored
+copy is considered rather than silently discarding a column. A value column
+the file does not hold fails its values check as well as its columns check,
+so omitted work earns no value points; one saved under another name with the
+right values costs only the columns check.
 
 Nothing here imports, runs, or inspects student code.
 """
@@ -92,10 +96,12 @@ class Slip:
     """A common wrong answer: the values it leaves, by row key and column, and what causes it.
 
     A values check names the cause when every wrong cell it found holds this slip's value.
+    Slips that share a `charge` come from one mistake, so only the first check naming one costs points.
     """
 
     cause: str
     rows: dict[tuple, dict[str, object]]
+    charge: str = ""
 
 
 @dataclass(frozen=True)
@@ -247,6 +253,32 @@ RANGES_FROM_VISIT_TIME = Slip(
                     "last_target_time": Instant("2026-05-04T21:51:00Z")},
     },
 )
+# summary_frame(alpha=0.10) gives 90% bounds for both intervals in one call; it costs points once.
+INTERVALS_AT_90 = Slip(
+    "Those are 90% intervals; summary_frame(alpha=0.05) gives the 95% intervals.",
+    {NEW_PATIENT: {"mean_ci_lower": 146.83531, "mean_ci_upper": 153.461769,
+                   "obs_ci_lower": 138.753737, "obs_ci_upper": 161.543342}},
+    charge="interval_alpha",
+)
+# Ranges read from every visit: the min and max followup_time of the whole table on every row.
+RANGES_FROM_ALL_VISITS = Slip(
+    "Those are the first and last followup_time of every visit; take each partition's own "
+    "followup_time.min() and max().",
+    {
+        ("validation",): {"first_target_time": Instant("2026-04-01T18:18:00Z"),
+                          "last_target_time": Instant("2026-05-18T21:51:00Z")},
+        ("test",): {"first_target_time": Instant("2026-04-01T18:18:00Z")},
+        ("train",): {"last_target_time": Instant("2026-05-18T21:51:00Z")},
+    },
+    charge="ranges_from_all_visits",
+)
+# One leak (a1c_result or callback_sbp kept as a feature) reaches Tasks 2.1, 3.1, and 3.2; it costs points once.
+LEAKY_AVAILABLE = Slip(
+    "Those features become known only after the visit ends, so marking them available leaks them into the "
+    "model's features.",
+    {(feature,): {"available": Flag(True)} for feature in ("a1c_result", "callback_sbp")},
+    charge="leakage",
+)
 # The pipeline fitted with a leaky feature as well: callback_sbp, a1c_result, or both.
 LEAKY_VALIDATION = Slip(
     "Those are the scores of a pipeline that also uses a1c_result or callback_sbp, which become known only "
@@ -254,19 +286,33 @@ LEAKY_VALIDATION = Slip(
     {("linear_pipeline",): {"mae": Either((2.002328, 3.291011, 1.987482)),
                             "rmse": Either((2.211588, 3.572686, 2.26713)),
                             "r2": Either((0.924388, 0.802681, 0.920543))}},
+    charge="leakage",
 )
 BASELINE_FROM_VALIDATION = Slip(
     "Those are the scores of a mean taken from the validation rows (130.25 mmHg); the baseline learns its "
     "mean from the training rows (134.13 mmHg).",
     {("mean_baseline",): {"mae": 6.75, "rmse": 8.042854, "r2": 0.0}},
 )
+# The Task 3.2 scaffold reuses Task 3.1's metric code, so one slip there reaches both tasks; it costs points once.
 RMSE_NOT_ROOTED = Slip(
     "Those are mean squared errors, in mmHg squared; RMSE is their square root, back in mmHg.",
     {("mean_baseline",): {"rmse": 79.767778}, ("linear_pipeline",): {"rmse": 13.539216}},
+    charge="rmse_not_rooted",
 )
 TEST_RMSE_NOT_ROOTED = Slip(
     "That is the mean squared error, in mmHg squared; RMSE is its square root, back in mmHg.",
     {("linear_pipeline",): {"rmse": Either((13.090932, 12.661851))}},
+    charge="rmse_not_rooted",
+)
+R2_ARGS_SWAPPED = Slip(
+    "That is what r2_score gives with the predictions first; pass the actual values first.",
+    {("mean_baseline",): {"r2": 0.0}, ("linear_pipeline",): {"r2": 0.617464}},
+    charge="r2_swapped",
+)
+TEST_R2_ARGS_SWAPPED = Slip(
+    "That is what r2_score gives with the test predictions first; pass test[TARGET] first.",
+    {("linear_pipeline",): {"r2": Either((0.771802, 0.788141))}},
+    charge="r2_swapped",
 )
 LEAKY_TEST = Slip(
     "Those are the test scores of a pipeline that also uses a1c_result or callback_sbp, which become known "
@@ -276,6 +322,7 @@ LEAKY_TEST = Slip(
         "rmse": Either((2.111613, 1.822818, 4.008395, 3.949808, 2.508591, 2.103367)),
         "r2": Either((0.935602, 0.952012, 0.767949, 0.774683, 0.909113, 0.936104)),
     }},
+    charge="leakage",
 )
 # Each test visit's prediction from those pipelines, in the same order as LEAKY_TEST.
 LEAKY_TEST_PREDICTIONS = Slip(
@@ -293,6 +340,7 @@ LEAKY_TEST_PREDICTIONS = Slip(
         "V47": (164.87556, 166.094788, 163.818391, 165.170387, 164.87074, 166.193853),
         "V48": (150.750689, 150.514727, 152.283146, 152.210843, 150.71794, 150.631268),
     }.items()},
+    charge="leakage",
 )
 TEST_SCORED_ON_VALIDATION = Slip(
     "Those are the pipeline's validation scores from Task 3.1; score test[TARGET] against the test predictions.",
@@ -743,14 +791,18 @@ def read_table(root: Path, artifact: Artifact) -> Table:
     return Table(columns=tuple(header), rows=rows, repeated=repeated)
 
 
-def _resolve(table: Table, artifact: Artifact) -> dict[str, str]:
+def _resolve(table: Table, artifact: Artifact, root: Path) -> dict[str, str]:
     """Map each expected column to the saved column that holds it.
 
     A column saved under its own name, in any letter case, is found by name. A
     key column saved under another name, such as a blank header over saved
-    index labels, is found by its values. If exactly one expected value column
-    is still unplaced and exactly one unexpected column is left, that column is
-    taken to hold it. A misnamed column then costs only the columns check.
+    index labels, is found by its values. An unexpected column whose values are
+    what a values check accepts for exactly one unplaced value column (see
+    `_accepted`, which reads the student's earlier artifacts under `root`) is
+    taken to hold it. If exactly one expected value column is still unplaced
+    and exactly one unexpected column is left, that column is taken to hold it.
+    A misnamed column then costs only the columns check, or its values check
+    too when its values are wrong.
     """
     expected = [_fold(column) for column in (*artifact.columns, *artifact.optional_columns)]
     found = {column: _fold(column) for column in artifact.columns if _fold(column) in table.columns}
@@ -769,6 +821,39 @@ def _resolve(table: Table, artifact: Artifact) -> dict[str, str]:
             spare.remove(candidates[0])
     # A key column is only ever found by name or by its values, never by elimination.
     unplaced = [column for column in artifact.columns if column not in found and column not in artifact.key]
+    slips = [slip for slip in globals().values() if isinstance(slip, Slip)]
+    placed = True
+    # Repeat while columns are placed: a residual is judged against the fitted column placed before it.
+    while placed and unplaced and spare:
+        placed = False
+        try:
+            grouped, _ = _group(table, artifact, found)
+        except AssertionError:
+            grouped = {}
+
+        def holds(other: str, column: str, slipped: bool) -> bool:
+            trial = {**found, column: other}
+            return bool(grouped) and all(
+                any(_matches(row[other], value, artifact.tolerance, column in PERCENT_COLUMNS) for value in (
+                    _accepted(root, artifact, key, rows, column, trial),
+                    # A common slip is charged once by its values check, so its values also identify the column.
+                    *(slip.rows[key][column] for slip in slips if slipped and column in slip.rows.get(key, {})),
+                ))
+                for key, rows in grouped.items() for row in rows
+            )
+
+        # A slip's values place a column only when the accepted values place none.
+        for slipped in (False, True):
+            fits = {other: [column for column in unplaced if holds(other, column, slipped)] for other in spare}
+            # A spare column that fits two expected columns places neither; of two spares that fit one, the first holds it.
+            for other, columns in fits.items():
+                if len(columns) == 1 and columns[0] not in found:
+                    found[columns[0]] = other
+                    placed = True
+            if placed:
+                break
+        spare = [column for column in spare if column not in found.values()]
+        unplaced = [column for column in unplaced if column not in found]
     if len(unplaced) == 1 and len(spare) == 1:
         found[unplaced[0]] = spare[0]
     return found
@@ -854,6 +939,9 @@ def _group(table: Table, artifact: Artifact, found: dict[str, str], checked: tup
             return grouped, unknown
         # The rows check has already charged for these labels; read the values beneath them anyway.
         found = {column: saved for column, saved in found.items() if column not in artifact.key}
+        if not found:
+            # A table of keys alone has no values to match its other rows by.
+            return grouped, []
         rows = unnamed
     else:
         rows = list(table.rows)
@@ -879,7 +967,7 @@ def columns_check(artifact: Artifact, hint: str) -> Callable[[Path], None]:
 
     def check(root: Path) -> None:
         table = read_table(root, artifact)
-        found = _resolve(table, artifact)
+        found = _resolve(table, artifact, root)
         # A saved index with no name leaves its column unheaded; holding the keys, it is the key column.
         first = table.columns[0] if table.columns else None
         unheaded = {
@@ -935,7 +1023,7 @@ def rows_check(artifact: Artifact, hint: str) -> Callable[[Path], None]:
 
     def check(root: Path) -> None:
         table = read_table(root, artifact)
-        grouped, unknown = _group(table, artifact, _resolve(table, artifact))
+        grouped, unknown = _group(table, artifact, _resolve(table, artifact, root))
         missing = [key for key in artifact.rows if key not in grouped]
         repeated = [key for key, rows in grouped.items() if len(rows) > 1]
         problems = []
@@ -968,6 +1056,48 @@ def _cause(misses: list[tuple[tuple, str, str]], artifact: Artifact, slips: tupl
     return ""
 
 
+# Rows whose values all belong under other labels: one mistake, charged by the artifact's first values check.
+RELABELED = "check the labels each row is saved under"
+# A values check missing a column records the slip it names but still fails, so the column earns no points.
+ABSENT = "the columns check says what to name"
+
+
+def _relabeled(grouped: dict[tuple, list[dict[str, str]]], artifact: Artifact, found: dict[str, str]) -> str:
+    """Where every expected row's values sit under another present label, the cause naming them, or "".
+
+    Only a whole permutation counts: each saved row holds, in every value column,
+    the values of its own key or of exactly one other, and every key is used once.
+    """
+    columns = [column for column in artifact.columns if column not in artifact.key and column in found]
+    if len(artifact.rows) < 2 or not columns or any(len(grouped.get(key, ())) != 1 for key in artifact.rows):
+        return ""
+
+    def fits(row: dict[str, str], key: tuple) -> bool:
+        return all(
+            _matches(row[found[column]], artifact.rows[key][column], artifact.tolerance, column in PERCENT_COLUMNS)
+            for column in columns
+        )
+
+    holder = {}
+    for key in artifact.rows:
+        row = grouped[key][0]
+        if fits(row, key):
+            holder[key] = key
+            continue
+        others = [other for other in artifact.rows if other != key and fits(row, other)]
+        if len(others) != 1:
+            return ""
+        holder[key] = others[0]
+    if sorted(holder.values()) != sorted(artifact.rows) or all(label == values for label, values in holder.items()):
+        return ""
+    moved = [
+        f"the values for {_key_name(values, artifact)} sit in {_key_name(label, artifact)}'s row"
+        for label, values in holder.items() if label != values
+    ]
+    shown = _listed(moved)
+    return f" {shown[0].upper()}{shown[1:]}; {RELABELED}."
+
+
 CLINIC_PREDICTORS = {
     'P01': (67.0, 24.2),
     'P02': (72.0, 35.4),
@@ -995,8 +1125,9 @@ CLINIC_PREDICTORS = {
 def _saved_fit(root: Path, age: float, bmi: float) -> float | None:
     try:
         table = read_table(root, COEFFICIENTS)
-        grouped, _ = _group(table, COEFFICIENTS, _resolve(table, COEFFICIENTS))
-        coefficients = [_number(grouped[(term,)][0]["coef"]) for term in ("Intercept", "age", "bmi")]
+        found = _resolve(table, COEFFICIENTS, root)
+        grouped, _ = _group(table, COEFFICIENTS, found)
+        coefficients = [_number(grouped[(term,)][0][found["coef"]]) for term in ("Intercept", "age", "bmi")]
         if all(value is not None for value in coefficients):
             return coefficients[0] + age * coefficients[1] + bmi * coefficients[2]
     except (AssertionError, OSError, KeyError, ValueError):
@@ -1008,8 +1139,9 @@ def _saved_test_metrics(root: Path) -> dict[str, float]:
     """Score the submitted predictions, so an earlier prediction error costs once."""
     try:
         table = read_table(root, TEST_PREDICTIONS)
-        actual = [_number(row["sbp_followup"]) for row in table.rows]
-        predicted = [_number(row["predicted_sbp"]) for row in table.rows]
+        found = _resolve(table, TEST_PREDICTIONS, root)
+        actual = [_number(row[found["sbp_followup"]]) for row in table.rows]
+        predicted = [_number(row[found["predicted_sbp"]]) for row in table.rows]
         if not actual or any(value is None for value in actual + predicted):
             return {}
         errors = [observed - fitted for observed, fitted in zip(actual, predicted)]
@@ -1019,15 +1151,52 @@ def _saved_test_metrics(root: Path) -> dict[str, float]:
         return {"mae": sum(abs(error) for error in errors) / len(errors),
                 "rmse": (squared / len(errors)) ** 0.5,
                 "r2": 1 - squared / total if total else 0.0}
-    except (AssertionError, OSError, KeyError, ValueError):
+    except (AssertionError, OSError, KeyError, ValueError, ArithmeticError):
         return {}
+
+
+def _accepted(root: Path, artifact: Artifact, key: tuple, rows: list[dict[str, str]], column: str,
+              found: dict[str, str]) -> object:
+    """What a values check accepts in `column` for this key's saved `rows`.
+
+    That is the expected value, or also one calculated from the student's own
+    earlier artifact or from the row's other saved columns, so an earlier
+    mistake costs points only once.
+    """
+    expected = artifact.rows[key][column]
+    if artifact is TEST_METRICS:
+        own = _saved_test_metrics(root).get(column)
+        if own is not None:
+            expected = Either((*expected.values, own)) if isinstance(expected, Either) else Either((expected, own))
+    if artifact is NEW_PATIENT_INTERVALS:
+        age, bmi = (_number(rows[0][found[name]]) if name in found else None for name in ("age", "bmi"))
+        own = _saved_fit(root, age, bmi) if age is not None and bmi is not None else None
+        if own is not None:
+            expected = Either((expected, expected + own - NEW_PATIENT_VALUES["mean"]))
+    if artifact is RESIDUALS and column == "fitted":
+        own = _saved_fit(root, *CLINIC_PREDICTORS[key[0]])
+        if own is not None:
+            expected = Either((expected, own))
+    if artifact is AVAILABILITY and column == "available" and "hours_after_visit" in found:
+        hours = _number(rows[0][found["hours_after_visit"]])
+        if hours is not None and not _matches(rows[0][found[column]], expected, artifact.tolerance):
+            expected = Flag(hours <= 0)
+    if artifact is AVAILABILITY and column == "decision" and "available" in found:
+        available = _flag(rows[0][found["available"]])
+        if available is not None and not _matches(rows[0][found[column]], expected, artifact.tolerance):
+            expected = Starts("keep" if available else "exclude")
+    if artifact is RESIDUALS and column == "residual" and all(name in found for name in ("observed", "fitted")):
+        observed, fitted = (_number(rows[0][found[name]]) for name in ("observed", "fitted"))
+        if observed is not None and fitted is not None:
+            expected = Either((expected, observed - fitted))
+    return expected
 
 
 def _holds(root: Path, artifact: Artifact, slip: Slip) -> bool:
     """Whether the saved artifact holds this slip's value in every cell the slip names."""
     try:
         table = read_table(root, artifact)
-        found = _resolve(table, artifact)
+        found = _resolve(table, artifact, root)
         grouped, _ = _group(table, artifact, found)
         return all(
             grouped.get(key) and column in found and all(
@@ -1050,22 +1219,19 @@ def values_check(
     """Every saved row for an expected key holds the expected values in `columns`.
 
     A missing or repeated row costs the rows check, not this one: this check
-    compares whatever rows the file does hold for the expected keys. When the
-    wrong values are those a common slip leaves, the message names its cause.
+    compares whatever rows the file does hold for the expected keys. A column
+    in `columns` the file does not hold fails this check as well as the columns
+    check, so omitted work earns no value points. When the wrong values are
+    those a common slip leaves, the message names its cause.
     """
 
     def check(root: Path) -> None:
         table = read_table(root, artifact)
-        found = _resolve(table, artifact)
-        # Schema charges omitted columns; judge the present values without skipping sibling mistakes.
+        found = _resolve(table, artifact, root)
         present = tuple(column for column in columns if column in found)
         grouped, _ = _group(table, artifact, found, present)
         _assert(
-            grouped and (present or any(
-                _key_matches(row[found[column]], key[position], artifact, column)
-                for key, rows in grouped.items() for row in rows
-                for position, column in enumerate(artifact.key) if column in found
-            )),
+            grouped,
             f"{artifact.path} has no row for {_join(_key_name(key, artifact) for key in artifact.rows)}, so its "
             f"{_join(columns)} values cannot be compared; the rows check says what to fix in {artifact.task}.",
         )
@@ -1076,32 +1242,7 @@ def values_check(
         misses = []
         for key, rows in grouped.items():
             for column in present:
-                expected = artifact.rows[key][column]
-                if artifact is TEST_METRICS:
-                    own = _saved_test_metrics(root).get(column)
-                    if own is not None:
-                        expected = Either((*expected.values, own)) if isinstance(expected, Either) else Either((expected, own))
-                if artifact is NEW_PATIENT_INTERVALS:
-                    age, bmi = (_number(rows[0][found[name]]) if name in found else None for name in ("age", "bmi"))
-                    own = _saved_fit(root, age, bmi) if age is not None and bmi is not None else None
-                    if own is not None:
-                        expected = Either((expected, expected + own - NEW_PATIENT_VALUES["mean"]))
-                if artifact is RESIDUALS and column == "fitted":
-                    own = _saved_fit(root, *CLINIC_PREDICTORS[key[0]])
-                    if own is not None:
-                        expected = Either((expected, own))
-                if artifact is AVAILABILITY and column == "available" and "hours_after_visit" in found:
-                    hours = _number(rows[0][found["hours_after_visit"]])
-                    if hours is not None and not _matches(rows[0][found[column]], expected, artifact.tolerance):
-                        expected = Flag(hours <= 0)
-                if artifact is AVAILABILITY and column == "decision" and "available" in found:
-                    available = _flag(rows[0][found["available"]])
-                    if available is not None and not _matches(rows[0][found[column]], expected, artifact.tolerance):
-                        expected = Starts("keep" if available else "exclude")
-                if artifact is RESIDUALS and column == "residual" and all(name in found for name in ("observed", "fitted")):
-                    observed, fitted = (_number(rows[0][found[name]]) for name in ("observed", "fitted"))
-                    if observed is not None and fitted is not None:
-                        expected = Either((expected, observed - fitted))
+                expected = _accepted(root, artifact, key, rows, column, found)
                 cells = [
                     row[found[column]] for row in rows
                     if not _matches(row[found[column]], expected, artifact.tolerance, column in PERCENT_COLUMNS)
@@ -1110,9 +1251,26 @@ def values_check(
                 given = sorted({_given(cell) for cell in cells})
                 if given:
                     wrong.append(f"{_key_name(key, artifact)} has {column} {_join(given)}, expected {_show(artifact.rows[key][column])}")
+        absent = [column for column in columns if column not in found]
+        if absent:
+            first = next(key for key in artifact.rows if key in grouped)
+            one = len(absent) == 1
+            _assert(
+                False,
+                f"{artifact.path} has no {_join(absent)} column{'' if one else 's'} (its columns are "
+                f"{_join(column or 'a column with no header' for column in table.columns) or 'none'}), so "
+                f"{'its' if one else 'their'} values cannot be compared; "
+                "expected " + _join(f"{column} {_show(artifact.rows[first][column])}" for column in absent)
+                + f" for {_key_name(first, artifact)}, for example. {'That column was' if one else 'Those columns were'} "
+                f"left out of the saved table or saved under another name; {ABSENT} {'it' if one else 'them'}."
+                + (f" Also, {_listed(wrong)}." + (_relabeled(grouped, artifact, found) or _cause(misses, artifact, named))
+                   if wrong else "")
+                + f" Fix it in {artifact.task}: {hint}",
+            )
         _assert(
             not wrong,
-            f"{artifact.path}: " + _listed(wrong) + "." + _cause(misses, artifact, named)
+            f"{artifact.path}: " + _listed(wrong) + "."
+            + (_relabeled(grouped, artifact, found) or _cause(misses, artifact, named))
             + f" Fix it in {artifact.task}: {hint}",
         )
 
@@ -1254,6 +1412,7 @@ CHECKS = (
         values_check(
             NEW_PATIENT_INTERVALS, ("mean_ci_lower", "mean_ci_upper"),
             "mean_ci_lower and mean_ci_upper bound the average SBP of patients like this one.",
+            (INTERVALS_AT_90,),
         ),
     ),
     Check(
@@ -1261,6 +1420,7 @@ CHECKS = (
         values_check(
             NEW_PATIENT_INTERVALS, ("obs_ci_lower", "obs_ci_upper"),
             "obs_ci_lower and obs_ci_upper bound one such patient's SBP; this interval is the wider one.",
+            (INTERVALS_AT_90,),
         ),
     ),
     # Task 1.3: output/ols_residuals.csv and output/residuals_vs_fitted.png
@@ -1312,7 +1472,7 @@ CHECKS = (
         values_check(
             AVAILABILITY, ("available",),
             "available is hours_after_visit <= 0: True when the feature is known by the end of the visit.",
-            (ZERO_HOURS_EXCLUDED,),
+            (ZERO_HOURS_EXCLUDED, LEAKY_AVAILABLE),
         ),
     ),
     Check(
@@ -1350,7 +1510,7 @@ CHECKS = (
         values_check(
             SPLIT, ("first_target_time",),
             "first_target_time is the partition's followup_time.min(), the full timestamp.",
-            (SPLIT_ON_VISIT_TIME, RANGES_FROM_VISIT_TIME),
+            (SPLIT_ON_VISIT_TIME, RANGES_FROM_VISIT_TIME, RANGES_FROM_ALL_VISITS),
         ),
     ),
     Check(
@@ -1358,7 +1518,7 @@ CHECKS = (
         values_check(
             SPLIT, ("last_target_time",),
             "last_target_time is the partition's followup_time.max(), the full timestamp.",
-            (SPLIT_ON_VISIT_TIME, RANGES_FROM_VISIT_TIME),
+            (SPLIT_ON_VISIT_TIME, RANGES_FROM_VISIT_TIME, RANGES_FROM_ALL_VISITS),
         ),
     ),
     # Task 3.1: output/validation_metrics.csv
@@ -1387,7 +1547,8 @@ CHECKS = (
     Check(
         "validation metrics: r2 values",
         values_check(
-            VALIDATION, ("r2",), f"r2 is r2_score(actual, predicted); {PIPELINE_HINT}", (LEAKY_VALIDATION, BASELINE_FROM_VALIDATION)
+            VALIDATION, ("r2",), f"r2 is r2_score(actual, predicted); {PIPELINE_HINT}",
+            (LEAKY_VALIDATION, BASELINE_FROM_VALIDATION, R2_ARGS_SWAPPED),
         ),
     ),
     # Task 3.2: output/test_metrics.csv and output/test_predictions.csv
@@ -1420,7 +1581,7 @@ CHECKS = (
         "test metrics: r2 value",
         values_check(
             TEST_METRICS, ("r2",), f"r2 is r2_score(test[TARGET], test_predicted), actual first; {TEST_HINT}",
-            (LEAKY_TEST, TEST_SCORED_ON_VALIDATION),
+            (LEAKY_TEST, TEST_SCORED_ON_VALIDATION, TEST_R2_ARGS_SWAPPED),
         ),
     ),
     Check(
@@ -1480,20 +1641,23 @@ def run_checks(root: Path) -> list[tuple[str, str | None]]:
     """Return one (check name, problem or None) pair per check; every check runs."""
     _REPORTED_OUTSIDE.clear()
     results = []
-    charged_causes = set()
-    causes = tuple(slip.cause for slip in globals().values() if isinstance(slip, Slip))
+    charged = set()
+    slips = tuple(slip for slip in globals().values() if isinstance(slip, Slip))
     for check in CHECKS:
         try:
             check.action(Path(root))
         except (AssertionError, OSError, ValueError, UnicodeDecodeError, csv.Error) as error:
             message = str(error)
-            cause = next((cause for cause in causes if cause in message), None)
-            if cause and cause in charged_causes:
+            slip = next((slip for slip in slips if slip.cause in message), None)
+            mistake = slip and (slip.charge or slip.cause)
+            if not mistake and RELABELED in message:
+                mistake = message.split()[0].rstrip(":") + RELABELED
+            if mistake and mistake in charged and ABSENT not in message:
                 results.append((check.name, None))
             else:
                 results.append((check.name, message))
-                if cause:
-                    charged_causes.add(cause)
+                if mistake:
+                    charged.add(mistake)
         else:
             results.append((check.name, None))
     return results
